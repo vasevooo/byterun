@@ -558,14 +558,23 @@ class VirtualMachine(object):
         elts = self.popn(count)
         self.push(set(elts))
 
-    def byte_BUILD_MAP(self, size):
-        # size is ignored.
-        self.push({})
+    def byte_BUILD_MAP(self, count):
+        # Build map from the top `count` pairs on the stack.
+        # Stack: key_1, val_1, key_2, val_2, ..., key_N, val_N
+        elts = self.popn(count * 2)
+        # We need to pair them up correctly
+        new_map = {}
+        for i in range(0, count * 2, 2):
+            key = elts[i]
+            value = elts[i+1]
+            new_map[key] = value
+        self.push(new_map)
 
-    def byte_STORE_MAP(self):
-        the_map, val, key = self.popn(3)
-        the_map[key] = val
-        self.push(the_map)
+    # STORE_MAP seems unused for dict displays in 3.5, comment out/remove
+    # def byte_STORE_MAP(self):
+    #     the_map, val, key = self.popn(3)
+    #     the_map[key] = val
+    #     self.push(the_map)
 
     def byte_UNPACK_SEQUENCE(self, count):
         seq = self.pop()
@@ -592,10 +601,11 @@ class VirtualMachine(object):
         the_set = self.peek(count)
         the_set.add(val)
 
-    def byte_MAP_ADD(self, count):
-        val, key = self.popn(2)
-        the_map = self.peek(count)
-        the_map[key] = val
+    def byte_MAP_ADD(self, i):
+        value = self.pop()
+        key = self.pop()
+        the_map = self.peek(2)
+        the_map[key] = value
 
     ## Printing
 
@@ -851,50 +861,121 @@ class VirtualMachine(object):
         fn = Function(name, code, globs, defaults, closure, self)
         self.push(fn)
 
+    def _call_function_core(self, func, posargs, namedargs):
+        """Core logic for executing a function call after arguments are processed."""
+        frame = self.frame # Current execution frame
+        retval = None
+        processed = False # Flag to indicate if we handled the call specially
+
+        # Special handling for __build_class__
+        # Ensure frame and builtins are accessible before checking
+        if (frame and hasattr(frame, 'f_builtins') and isinstance(frame.f_builtins, dict) and
+                '__build_class__' in frame.f_builtins and
+                func is frame.f_builtins.get('__build_class__')):
+
+            # Arguments expected by __build_class__: function, name, *bases
+            # Assumes posargs = [function, name, base1, ..., baseN]
+            if len(posargs) < 2: # Need at least function and name
+                 raise VirtualMachineError("Not enough arguments for __build_class__")
+
+            class_body_func = posargs[0] # Function is the first element
+            class_name = posargs[1]      # Name is the second
+            bases = tuple(posargs[2:])   # Bases are the rest
+
+            if not isinstance(class_body_func, Function):
+                raise VirtualMachineError("__build_class__ expected a Function object, got %s" % type(class_body_func))
+
+            class_namespace = {}
+            class_body_frame = self.make_frame(
+                code=class_body_func.func_code,
+                f_globals=frame.f_globals,
+                f_locals=class_namespace
+            )
+            self.run_frame(class_body_frame)
+
+            # TODO: Handle metaclass keyword argument if present in namedargs
+
+            retval = type(class_name, bases, class_namespace)
+            processed = True # Mark as handled
+
+        # Standard function call
+        if not processed:
+            if isinstance(func, Function):
+                 # Custom Function object - handles frame creation itself
+                 retval = func(*posargs, **namedargs)
+            else:
+                 # Built-in function or other Python callable
+                 try:
+                     retval = func(*posargs, **namedargs)
+                 except TypeError as e:
+                     raise
+
+        self.push(retval)
+        # Note: This core logic doesn't return 'why', the caller byte_* method does.
+
+    def call_function(self, arg):
+        """Parses stack arguments for CALL_FUNCTION based on `arg` 
+           and then calls _call_function_core.
+        """
+        lenKw = (arg >> 8) & 0xFF
+        lenPos = arg & 0xFF
+
+        namedargs = {}
+        # Pop keyword args (value, key pairs)
+        # Stack order: func, pos1 .. posN, val1, key1, ..., valM, keyM
+        for _ in range(lenKw):
+            value = self.pop()
+            key = self.pop()
+            namedargs[key] = value
+
+        # Pop positional args
+        posargs = self.popn(lenPos)
+
+        # Pop the function
+        func = self.pop()
+
+        # Execute the call using the core logic
+        self._call_function_core(func, posargs, namedargs)
+        # byte_CALL_FUNCTION itself doesn't return 'why'
+
     def byte_CALL_FUNCTION(self, arg):
-        return self.call_function(arg, [], {})
+        # Let call_function parse stack based on arg and execute
+        self.call_function(arg)
+        # No return 'why' needed here, _call_function_core pushes result
+
 
     def byte_CALL_FUNCTION_VAR(self, arg):
-        args = self.pop()
-        return self.call_function(arg, args, {})
+        # Stack: func, pos1, ..., posN, args_tuple
+        args_tuple = self.pop()
+        lenPos = arg & 0xFF
+        posargs = self.popn(lenPos)
+        func = self.pop()
+
+        all_posargs = list(posargs) + list(args_tuple)
+        self._call_function_core(func, all_posargs, {})
+
 
     def byte_CALL_FUNCTION_KW(self, arg):
-        kwargs = self.pop()
-        return self.call_function(arg, [], kwargs)
+        # Stack: func, pos1, ..., posN, kwargs_dict
+        kwargs_dict = self.pop()
+        lenPos = arg & 0xFF
+        posargs = self.popn(lenPos)
+        func = self.pop()
+
+        self._call_function_core(func, posargs, kwargs_dict)
+
 
     def byte_CALL_FUNCTION_VAR_KW(self, arg):
-        args, kwargs = self.popn(2)
-        return self.call_function(arg, args, kwargs)
-
-    def call_function(self, arg, args, kwargs):
-        lenKw, lenPos = divmod(arg, 256)
-        namedargs = {}
-        for i in range(lenKw):
-            key, val = self.popn(2)
-            namedargs[key] = val
-        namedargs.update(kwargs)
+        # Stack: func, pos1, ..., posN, args_tuple, kwargs_dict
+        kwargs_dict = self.pop()
+        args_tuple = self.pop()
+        lenPos = arg & 0xFF
         posargs = self.popn(lenPos)
-        posargs.extend(args)
-
         func = self.pop()
-        frame = self.frame
-        if hasattr(func, 'im_func'):
-            # Methods get self as an implicit first parameter.
-            if func.im_self:
-                posargs.insert(0, func.im_self)
-            # The first parameter must be the correct type.
-            if not isinstance(posargs[0], func.im_class):
-                raise TypeError(
-                    'unbound method %s() must be called with %s instance '
-                    'as first argument (got %s instance instead)' % (
-                        func.im_func.func_name,
-                        func.im_class.__name__,
-                        type(posargs[0]).__name__,
-                    )
-                )
-            func = func.im_func
-        retval = func(*posargs, **namedargs)
-        self.push(retval)
+
+        all_posargs = list(posargs) + list(args_tuple)
+        self._call_function_core(func, all_posargs, kwargs_dict)
+
 
     def byte_RETURN_VALUE(self):
         self.return_value = self.pop()
@@ -934,7 +1015,7 @@ class VirtualMachine(object):
             # Returning "yield" prevents the block stack cleanup code
             # from executing, suspending the frame in its current state.
             return "yield"
-
+        
     ## Importing
 
     def byte_IMPORT_NAME(self, name):
@@ -963,8 +1044,21 @@ class VirtualMachine(object):
         exec(stmt, globs, locs)
 
     def byte_LOAD_BUILD_CLASS(self):
-            # New in py3
-            self.push(__build_class__)
+        # New in py3
+        # Retrieve the actual __build_class__ function from the current frame's builtins
+        try:
+            build_class_func = self.frame.f_builtins['__build_class__']
+        except KeyError:
+            # Fallback if somehow not in f_builtins, try the global builtins
+            # This might happen if the frame was created without proper builtins
+            import builtins
+            build_class_func = builtins.__build_class__
+        except AttributeError:
+             # Handle case where f_builtins might not be a dict (shouldn't happen in normal execution)
+             # Or if self.frame is None (should also not happen here)
+             raise VirtualMachineError("Cannot access builtins in current frame")
+
+        self.push(build_class_func) # Push the actual function object
 
     def byte_STORE_LOCALS(self):
         self.frame.f_locals = self.pop()

@@ -27,20 +27,26 @@ class Function(object):
         self._vm = vm
         self.func_code = code
         self.func_name = self.__name__ = name or code.co_name
-        self.func_defaults = tuple(defaults)
+        # Ensure defaults is a tuple or None right after receiving it
+        self.func_defaults = tuple(defaults) if defaults else None
         self.func_globals = globs
-        self.func_locals = self._vm.frame.f_locals
+        self.func_locals = {}
         self.__dict__ = {}
-        self.func_closure = closure
+        self.func_closure = closure # closure is already a tuple of Cell objects
         self.__doc__ = code.co_consts[0] if code.co_consts else None
 
-        # Sometimes, we need a real Python function.  This is for that.
+        # Adapt for Python 3.5 where types.FunctionType needs slightly different args
         kw = {
+             # Now self.func_defaults is guaranteed to be a tuple or None
             'argdefs': self.func_defaults,
         }
         if closure:
-            kw['closure'] = tuple(make_cell(0) for _ in closure)
-        self._func = types.FunctionType(code, globs, **kw)
+            # Create real cell objects for types.FunctionType closure argument
+            kw['closure'] = tuple(make_cell(c.get()) for c in closure) # Use make_cell
+
+        # Create a real function object for introspection, but don't use it for execution
+        # Pass name explicitly for Py3.5
+        self._func = types.FunctionType(code, globs, name=self.func_name, **kw)
 
     def __repr__(self):         # pragma: no cover
         return '<Function %s at 0x%08x>' % (
@@ -54,7 +60,24 @@ class Function(object):
             return self
 
     def __call__(self, *args, **kwargs):
-        callargs = inspect.getcallargs(self._func, *args, **kwargs)
+        # Special case for comprehensions/generators: don't use inspect
+        if self.func_name.startswith('<') and self.func_code.co_argcount == 1:
+            # The internal name for this single arg (e.g., '.0') is the first varname
+            implicit_arg_name = self.func_code.co_varnames[0]
+            callargs = {implicit_arg_name: args[0]} if args else {}
+        else:
+            # Standard function call: use inspect for argument binding
+            import inspect
+            try:
+                callargs = inspect.getcallargs(self._func, *args, **kwargs)
+            except TypeError as e:
+                # Re-raise, trying to match CPython message format more closely
+                if e.args:
+                    raise TypeError(e.args[0]) from e
+                else:
+                    raise # Re-raise original if no args
+
+        # Create the frame with the calculated arguments
         frame = self._vm.make_frame(
             self.func_code, callargs, self.func_globals, {}
         )
