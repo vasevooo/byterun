@@ -1,0 +1,10 @@
+[project]
+name = "byterun"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "six>=1.4",
+    "tox>=4.25.0",
+]
