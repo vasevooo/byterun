@@ -4,9 +4,6 @@ import collections
 import inspect
 import types
 
-import six
-
-PY3, PY2 = six.PY3, not six.PY3
 
 
 def make_cell(value):
@@ -14,10 +11,8 @@ def make_cell(value):
     # Construct an actual cell object by creating a closure right here,
     # and grabbing the cell object out of the function we create.
     fn = (lambda x: lambda: x)(value)
-    if PY3:
-        return fn.__closure__[0]
-    else:
-        return fn.func_closure[0]
+    return fn.__closure__[0]
+
 
 
 class Function(object):
@@ -32,20 +27,26 @@ class Function(object):
         self._vm = vm
         self.func_code = code
         self.func_name = self.__name__ = name or code.co_name
-        self.func_defaults = tuple(defaults)
+        # Ensure defaults is a tuple or None right after receiving it
+        self.func_defaults = tuple(defaults) if defaults else None
         self.func_globals = globs
-        self.func_locals = self._vm.frame.f_locals
+        self.func_locals = {}
         self.__dict__ = {}
-        self.func_closure = closure
+        self.func_closure = closure # closure is already a tuple of Cell objects
         self.__doc__ = code.co_consts[0] if code.co_consts else None
 
-        # Sometimes, we need a real Python function.  This is for that.
+        # Adapt for Python 3.5 where types.FunctionType needs slightly different args
         kw = {
+             # Now self.func_defaults is guaranteed to be a tuple or None
             'argdefs': self.func_defaults,
         }
         if closure:
-            kw['closure'] = tuple(make_cell(0) for _ in closure)
-        self._func = types.FunctionType(code, globs, **kw)
+            # Create real cell objects for types.FunctionType closure argument
+            kw['closure'] = tuple(make_cell(c.get()) for c in closure) # Use make_cell
+
+        # Create a real function object for introspection, but don't use it for execution
+        # Pass name explicitly for Py3.5
+        self._func = types.FunctionType(code, globs, name=self.func_name, **kw)
 
     def __repr__(self):         # pragma: no cover
         return '<Function %s at 0x%08x>' % (
@@ -55,21 +56,28 @@ class Function(object):
     def __get__(self, instance, owner):
         if instance is not None:
             return Method(instance, owner, self)
-        if PY2:
-            return Method(None, owner, self)
         else:
             return self
 
     def __call__(self, *args, **kwargs):
-        if PY2 and self.func_name in ["<setcomp>", "<dictcomp>", "<genexpr>"]:
-            # D'oh! http://bugs.python.org/issue19611 Py2 doesn't know how to
-            # inspect set comprehensions, dict comprehensions, or generator
-            # expressions properly.  They are always functions of one argument,
-            # so just do the right thing.
-            assert len(args) == 1 and not kwargs, "Surprising comprehension!"
-            callargs = {".0": args[0]}
+        # Special case for comprehensions/generators: don't use inspect
+        if self.func_name.startswith('<') and self.func_code.co_argcount == 1:
+            # The internal name for this single arg (e.g., '.0') is the first varname
+            implicit_arg_name = self.func_code.co_varnames[0]
+            callargs = {implicit_arg_name: args[0]} if args else {}
         else:
-            callargs = inspect.getcallargs(self._func, *args, **kwargs)
+            # Standard function call: use inspect for argument binding
+            import inspect
+            try:
+                callargs = inspect.getcallargs(self._func, *args, **kwargs)
+            except TypeError as e:
+                # Re-raise, trying to match CPython message format more closely
+                if e.args:
+                    raise TypeError(e.args[0]) from e
+                else:
+                    raise # Re-raise original if no args
+
+        # Create the frame with the calculated arguments
         frame = self._vm.make_frame(
             self.func_code, callargs, self.func_globals, {}
         )
@@ -188,8 +196,8 @@ class Frame(object):
         # We don't keep f_lineno up to date, so calculate it based on the
         # instruction address and the line number table.
         lnotab = self.f_code.co_lnotab
-        byte_increments = six.iterbytes(lnotab[0::2])
-        line_increments = six.iterbytes(lnotab[1::2])
+        byte_increments = iter(lnotab[0::2])
+        line_increments = iter(lnotab[1::2])
 
         byte_num = 0
         line_num = self.f_code.co_firstlineno
