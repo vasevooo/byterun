@@ -1,6 +1,6 @@
 """Execute files of Python code."""
 
-import imp
+import importlib
 import os
 import sys
 import tokenize
@@ -61,7 +61,7 @@ def run_python_module(modulename, args):
             else:
                 packagename, name = None, modulename
                 searchpath = None  # "top-level search" in imp.find_module()
-            openfile, pathname, _ = imp.find_module(name, searchpath)
+            openfile, pathname, _ = importlib.find_module(name, searchpath)
 
             # Complain if this is a magic non-file module.
             if openfile is None and pathname is None:
@@ -76,7 +76,7 @@ def run_python_module(modulename, args):
                 name = '__main__'
                 package = __import__(packagename, glo, loc, ['__path__'])
                 searchpath = package.__path__
-                openfile, pathname, _ = imp.find_module(name, searchpath)
+                openfile, pathname, _ = importlib.find_module(name, searchpath)
         except ImportError:
             _, err, _ = sys.exc_info()
             raise NoSource(str(err))
@@ -100,7 +100,7 @@ def run_python_file(filename, args, package=None):
     """
     # Create a module to serve as __main__
     old_main_mod = sys.modules['__main__']
-    main_mod = imp.new_module('__main__')
+    main_mod = importlib.new_module('__main__')
     sys.modules['__main__'] = main_mod
     main_mod.__file__ = filename
     if package:
